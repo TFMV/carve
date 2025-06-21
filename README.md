@@ -18,3 +18,15 @@ carve --pattern '(?P<ts>[^ ]+) (?P<level>[A-Z]+) (?P<msg>.+)' \
 ```
 
 The resulting `.arrow` file can be queried with DuckDB or other analytics engines.
+
+### Schema Introspection
+
+```bash
+carve --pattern '^(?P<ts>[^ ]+) \[(?P<level>[A-Z]+)\] (?P<msg>.+)' --schema
+```
+
+### Example DuckDB Query
+
+```sql
+SELECT msg FROM 'logs.arrow' WHERE level = 'WARN';
+```

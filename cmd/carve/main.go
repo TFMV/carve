@@ -1,111 +1,123 @@
 package main
 
 import (
-    "bufio"
-    "flag"
-    "fmt"
-    "io"
-    "log"
-    "os"
-    "regexp"
+	"bufio"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"regexp"
 
-    "github.com/apache/arrow/go/v18/arrow"
-    "github.com/apache/arrow/go/v18/arrow/array"
-    "github.com/apache/arrow/go/v18/arrow/ipc"
-    "github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/ipc"
+	"github.com/apache/arrow/go/v18/arrow/memory"
+
+	"carve/pkg/carve"
 )
 
+const version = "0.2.0"
+
 func main() {
-    pattern := flag.String("pattern", "", "regex pattern with named capture groups")
-    input := flag.String("input", "", "input file (defaults to stdin)")
-    output := flag.String("output", "", "output Arrow IPC file")
-    maxRows := flag.Int("max-rows", 0, "maximum rows to process (0 for no limit)")
-    flag.Parse()
+	pattern := flag.String("pattern", "", "regex pattern with named capture groups")
+	input := flag.String("input", "", "input file (defaults to stdin)")
+	output := flag.String("output", "", "output Arrow IPC file")
+	flush := flag.Int("flush-interval", 10000, "rows per record batch")
+	schemaOnly := flag.Bool("schema", false, "print inferred schema and exit")
+	verbose := flag.Bool("verbose", false, "verbose logging")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Parse()
 
-    if *pattern == "" || *output == "" {
-        flag.Usage()
-        os.Exit(1)
-    }
+	if *showVersion {
+		fmt.Println("carve", version)
+		return
+	}
+	if *pattern == "" {
+		log.Fatal("--pattern flag is required")
+	}
+	if *output == "" && !*schemaOnly {
+		log.Fatal("--output flag is required")
+	}
 
-    re, err := regexp.Compile(*pattern)
-    if err != nil {
-        log.Fatalf("failed to compile pattern: %v", err)
-    }
+	re, err := regexp.Compile(*pattern)
+	if err != nil {
+		log.Fatalf("failed to compile pattern: %v", err)
+	}
 
-    subexpNames := re.SubexpNames()
-    var groupIdx []int
-    var fields []arrow.Field
-    for i, name := range subexpNames {
-        if name == "" {
-            continue
-        }
-        groupIdx = append(groupIdx, i)
-        fields = append(fields, arrow.Field{Name: name, Type: arrow.BinaryTypes.String})
-    }
-    if len(fields) == 0 {
-        log.Fatalf("pattern must contain at least one named capture group")
-    }
+	schema, err := carve.ExtractSchema(re)
+	if err != nil {
+		log.Fatalf("schema error: %v", err)
+	}
+	if *schemaOnly {
+		fmt.Println(schema)
+		return
+	}
 
-    schema := arrow.NewSchema(fields, nil)
-    mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	mem := memory.DefaultAllocator
+	writer := carve.NewArrowWriter(schema, mem, *flush)
 
-    builders := make([]*array.StringBuilder, len(fields))
-    for i := range builders {
-        builders[i] = array.NewStringBuilder(mem)
-    }
+	var r *os.File
+	if *input != "" {
+		f, err := os.Open(*input)
+		if err != nil {
+			log.Fatalf("failed to open input: %v", err)
+		}
+		r = f
+		defer f.Close()
+	} else {
+		r = os.Stdin
+	}
 
-    var r io.Reader = os.Stdin
-    if *input != "" {
-        f, err := os.Open(*input)
-        if err != nil {
-            log.Fatalf("failed to open input: %v", err)
-        }
-        defer f.Close()
-        r = f
-    }
-
-    scanner := bufio.NewScanner(r)
-    rowCount := 0
-    for scanner.Scan() {
-        line := scanner.Text()
-        matches := re.FindStringSubmatch(line)
-        if matches == nil {
-            continue
-        }
-        for i, idx := range groupIdx {
-            builders[i].Append(matches[idx])
-        }
-        rowCount++
-        if *maxRows > 0 && rowCount >= *maxRows {
-            break
-        }
-    }
-    if err := scanner.Err(); err != nil {
-        log.Fatalf("scan error: %v", err)
-    }
-
-    arrays := make([]arrow.Array, len(builders))
-    for i, b := range builders {
-        arrays[i] = b.NewArray()
-        defer arrays[i].Release()
-        b.Release()
-    }
-
-    table := array.NewTable(schema, arrays, int64(rowCount))
-    defer table.Release()
-
-    outFile, err := os.Create(*output)
-    if err != nil {
-        log.Fatalf("failed to create output: %v", err)
-    }
-    defer outFile.Close()
-
-    writer := ipc.NewFileWriter(outFile, ipc.WithSchema(schema))
-    if err := writer.Write(table); err != nil {
-        log.Fatalf("failed to write table: %v", err)
-    }
-    writer.Close()
-
-    fmt.Printf("wrote %d rows to %s\n", rowCount, *output)
+	scanner := bufio.NewScanner(r)
+	rows := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		vals := carve.ParseLine(line, re)
+		if vals == nil {
+			if *verbose {
+				log.Printf("[warn] line %d: does not match pattern", rows+1)
+			}
+			continue
+		}
+		writer.Append(vals)
+		if writer.ShouldFlush() {
+			rec := writer.Flush()
+			err := writeRecord(*output, schema, rec, rows == 0)
+			rec.Release()
+			if err != nil {
+				log.Fatalf("write error: %v", err)
+			}
+		}
+		rows++
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("scan error: %v", err)
+	}
+	if writer.Rows() > 0 {
+		rec := writer.Flush()
+		err := writeRecord(*output, schema, rec, rows == 0)
+		rec.Release()
+		if err != nil {
+			log.Fatalf("write error: %v", err)
+		}
+	}
+	fmt.Printf("wrote %d rows to %s\n", rows, *output)
 }
 
+func writeRecord(path string, schema *arrow.Schema, rec arrow.Record, newFile bool) error {
+	var f *os.File
+	var err error
+	if newFile {
+		f, err = os.Create(path)
+	} else {
+		f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := ipc.NewFileWriter(f, ipc.WithSchema(schema))
+	if err := w.Write(rec); err != nil {
+		return err
+	}
+	return w.Close()
+}
