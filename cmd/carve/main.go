@@ -7,10 +7,11 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"time"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/ipc"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"carve/pkg/carve"
 )
@@ -25,6 +26,19 @@ func main() {
 	schemaOnly := flag.Bool("schema", false, "print inferred schema and exit")
 	verbose := flag.Bool("verbose", false, "verbose logging")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	benchReport := flag.Bool("bench-report", false, "emit per-batch timing information")
+	maxRows := flag.Int("max-rows", 0, "limit processed input (0 = unlimited)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "carve - convert structured logs to Arrow format\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s --pattern '^(?P<ts>[^ ]+) (?P<level>\\w+) (?P<msg>.+)' --input app.log --output out.arrow\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --pattern '^(?P<ts>[^ ]+) (?P<level>\\w+) (?P<msg>.+)' --schema\n", os.Args[0])
+	}
+
 	flag.Parse()
 
 	if *showVersion {
@@ -32,10 +46,14 @@ func main() {
 		return
 	}
 	if *pattern == "" {
-		log.Fatal("--pattern flag is required")
+		fmt.Fprintf(os.Stderr, "Error: --pattern flag is required\n\n")
+		flag.Usage()
+		os.Exit(1)
 	}
 	if *output == "" && !*schemaOnly {
-		log.Fatal("--output flag is required")
+		fmt.Fprintf(os.Stderr, "Error: --output flag is required\n\n")
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	re, err := regexp.Compile(*pattern)
@@ -48,7 +66,7 @@ func main() {
 		log.Fatalf("schema error: %v", err)
 	}
 	if *schemaOnly {
-		fmt.Println(schema)
+		printSchema(schema)
 		return
 	}
 
@@ -67,57 +85,90 @@ func main() {
 		r = os.Stdin
 	}
 
+	// Create output file and IPC writer once
+	outFile, err := os.Create(*output)
+	if err != nil {
+		log.Fatalf("failed to create output: %v", err)
+	}
+	defer outFile.Close()
+
+	ipcWriter, err := ipc.NewFileWriter(outFile, ipc.WithSchema(schema))
+	if err != nil {
+		log.Fatalf("failed to create IPC writer: %v", err)
+	}
+	defer ipcWriter.Close()
+
 	scanner := bufio.NewScanner(r)
-	rows := 0
+	lineNum := 0
+	totalRows := 0
+	var batchStart time.Time
+	if *benchReport {
+		batchStart = time.Now()
+	}
+
 	for scanner.Scan() {
+		lineNum++
 		line := scanner.Text()
+
+		// Check max-rows limit
+		if *maxRows > 0 && totalRows >= *maxRows {
+			if *verbose {
+				log.Printf("reached max-rows limit of %d", *maxRows)
+			}
+			break
+		}
+
 		vals := carve.ParseLine(line, re)
 		if vals == nil {
 			if *verbose {
-				log.Printf("[warn] line %d: does not match pattern", rows+1)
+				log.Printf("[warn] line %d: does not match pattern", lineNum)
 			}
 			continue
 		}
 		writer.Append(vals)
+		totalRows++
+
 		if writer.ShouldFlush() {
 			rec := writer.Flush()
-			err := writeRecord(*output, schema, rec, rows == 0)
-			rec.Release()
-			if err != nil {
+			if err := ipcWriter.Write(rec); err != nil {
+				rec.Release()
 				log.Fatalf("write error: %v", err)
 			}
+			if *benchReport {
+				duration := time.Since(batchStart)
+				log.Printf("[bench] batch: %d rows, %v", rec.NumRows(), duration)
+				batchStart = time.Now()
+			}
+			rec.Release()
 		}
-		rows++
 	}
+
 	if err := scanner.Err(); err != nil {
 		log.Fatalf("scan error: %v", err)
 	}
+
+	// Flush remaining rows
 	if writer.Rows() > 0 {
 		rec := writer.Flush()
-		err := writeRecord(*output, schema, rec, rows == 0)
-		rec.Release()
-		if err != nil {
+		if err := ipcWriter.Write(rec); err != nil {
+			rec.Release()
 			log.Fatalf("write error: %v", err)
 		}
+		if *benchReport {
+			duration := time.Since(batchStart)
+			log.Printf("[bench] final batch: %d rows, %v", rec.NumRows(), duration)
+		}
+		rec.Release()
 	}
-	fmt.Printf("wrote %d rows to %s\n", rows, *output)
+
+	if *verbose {
+		fmt.Printf("processed %d lines, wrote %d rows to %s\n", lineNum, totalRows, *output)
+	}
 }
 
-func writeRecord(path string, schema *arrow.Schema, rec arrow.Record, newFile bool) error {
-	var f *os.File
-	var err error
-	if newFile {
-		f, err = os.Create(path)
-	} else {
-		f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+func printSchema(schema *arrow.Schema) {
+	fmt.Printf("Schema (%d fields):\n", len(schema.Fields()))
+	for i, field := range schema.Fields() {
+		fmt.Printf("  %d: %s (%s)\n", i, field.Name, field.Type)
 	}
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w := ipc.NewFileWriter(f, ipc.WithSchema(schema))
-	if err := w.Write(rec); err != nil {
-		return err
-	}
-	return w.Close()
 }

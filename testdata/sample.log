@@ -1,4 +1,11 @@
-2023-01-01 INFO start
-2023-01-01 WARN warning
-bad line
-2023-01-01 ERROR failed
+2023-01-01T10:00:00.123Z INFO Application starting up
+2023-01-01T10:00:01.456Z INFO Database connection established
+2023-01-01T10:00:02.789Z WARN Configuration file not found, using defaults
+bad line without proper format
+2023-01-01T10:00:03.012Z ERROR Failed to load user preferences
+2023-01-01T10:00:04.345Z DEBUG Processing user request for ID 12345
+2023-01-01T10:00:05.678Z INFO Request processed successfully
+another malformed line
+2023-01-01T10:00:06.901Z WARN Memory usage approaching threshold
+2023-01-01T10:00:07.234Z ERROR Connection timeout to external service
+2023-01-01T10:00:08.567Z INFO Cleanup process completed

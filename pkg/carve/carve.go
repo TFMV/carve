@@ -4,9 +4,9 @@ import (
 	"errors"
 	"regexp"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // ExtractSchema builds an Arrow schema from the named capture groups in the regex.
@@ -49,6 +49,7 @@ func ParseLine(line string, re *regexp.Regexp) []string {
 type ArrowWriter struct {
 	schema      *arrow.Schema
 	builders    []*array.StringBuilder
+	mem         memory.Allocator
 	maxRows     int
 	rowsInBatch int
 }
@@ -62,7 +63,7 @@ func NewArrowWriter(schema *arrow.Schema, mem memory.Allocator, maxRows int) *Ar
 	for i := range builders {
 		builders[i] = array.NewStringBuilder(mem)
 	}
-	return &ArrowWriter{schema: schema, builders: builders, maxRows: maxRows}
+	return &ArrowWriter{schema: schema, builders: builders, mem: mem, maxRows: maxRows}
 }
 
 // Append adds a row of string values to the current batch.
@@ -89,7 +90,7 @@ func (w *ArrowWriter) Flush() arrow.Record {
 	for i, b := range w.builders {
 		arrays[i] = b.NewArray()
 		b.Release()
-		w.builders[i] = array.NewStringBuilder(b.Memory())
+		w.builders[i] = array.NewStringBuilder(w.mem)
 	}
 	rec := array.NewRecord(w.schema, arrays, int64(w.rowsInBatch))
 	for _, arr := range arrays {
