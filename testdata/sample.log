@@ -1,0 +1,4 @@
+2023-01-01 INFO start
+2023-01-01 WARN warning
+bad line
+2023-01-01 ERROR failed
