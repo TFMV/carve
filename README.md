@@ -1,5 +1,7 @@
 # Carve
 
+[![Build and Test](https://github.com/TFMV/carve/actions/workflows/go.yml/badge.svg)](https://github.com/TFMV/carve/actions/workflows/go.yml)
+
 **Carve** is a high-performance, Arrow-native log parser that transforms structured logs into Apache Arrow format for fast analytics. Built in Go with zero external dependencies for the binary.
 
 ## Features
