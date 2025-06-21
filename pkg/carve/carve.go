@@ -31,18 +31,42 @@ func ExtractSchema(re *regexp.Regexp) (*arrow.Schema, error) {
 
 // ParseLine returns regex capture groups for the line. Non-matching lines return nil.
 func ParseLine(line string, re *regexp.Regexp) []string {
+	return ExtractValues[string](line, re)
+}
+
+// ExtractValues returns regex capture groups for the line as either strings or
+// byte slices depending on the type parameter. The slice capacity matches the
+// number of capture groups to minimize allocations. Non-matching lines return
+// nil.
+func ExtractValues[T ~string | ~[]byte](line T, re *regexp.Regexp) []T {
 	if re == nil {
 		return nil
 	}
-	m := re.FindStringSubmatch(line)
-	if m == nil {
+
+	switch any(line).(type) {
+	case string:
+		m := re.FindStringSubmatch(string(line))
+		if m == nil {
+			return nil
+		}
+		out := make([]T, 0, len(m)-1)
+		for i := 1; i < len(m); i++ {
+			out = append(out, T(m[i]))
+		}
+		return out
+	case []byte:
+		m := re.FindSubmatch([]byte(line))
+		if m == nil {
+			return nil
+		}
+		out := make([]T, 0, len(m)-1)
+		for i := 1; i < len(m); i++ {
+			out = append(out, T(m[i]))
+		}
+		return out
+	default:
 		return nil
 	}
-	out := make([]string, 0, len(re.SubexpNames())-1)
-	for i := 1; i < len(m); i++ {
-		out = append(out, m[i])
-	}
-	return out
 }
 
 // ArrowWriter writes record batches with flushing to limit memory usage.
