@@ -1,6 +1,6 @@
 module carve
 
-go 1.23.8
+go 1.24.3
 
 require github.com/apache/arrow-go/v18 v18.3.1
 
