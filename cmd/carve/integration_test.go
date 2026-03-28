@@ -43,7 +43,7 @@ func TestCLI_SchemaFlag(t *testing.T) {
 	if !regexp.MustCompile(`Schema \(3 fields\):`).MatchString(output) {
 		t.Fatalf("unexpected schema output: %s", output)
 	}
-	if !regexp.MustCompile(`timestamp.*(utf8|string)`).MatchString(output) {
+	if !regexp.MustCompile(`timestamp.*binary`).MatchString(output) {
 		t.Fatalf("missing timestamp field in schema: %s", output)
 	}
 }

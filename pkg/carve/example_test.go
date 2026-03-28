@@ -29,9 +29,9 @@ func Example() {
 
 	// Output:
 	// Schema has 3 fields
-	// Field 0: timestamp (utf8)
-	// Field 1: level (utf8)
-	// Field 2: message (utf8)
+	// Field 0: timestamp (binary)
+	// Field 1: level (binary)
+	// Field 2: message (binary)
 }
 
 // ExampleExtractSchema demonstrates schema extraction from regex patterns
@@ -53,8 +53,8 @@ func ExampleExtractSchema() {
 
 	// Output:
 	// Fields: 2
-	// - level (utf8)
-	// - message (utf8)
+	// - level (binary)
+	// - message (binary)
 }
 
 // ExampleParseLine demonstrates parsing individual log lines

@@ -1,27 +1,308 @@
 package carve
 
 import (
+	"bytes"
 	"errors"
 	"regexp"
+	"regexp/syntax"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
-// ExtractSchema builds an Arrow schema from the named capture groups in the regex.
+// ============================================================
+// Public API
+// ============================================================
+
+// New creates a high-performance scanner from a regex pattern.
+// Only named capture groups are supported.
+func New(pattern string) (*Scanner, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	schema, err := ExtractSchema(re)
+	if err != nil {
+		return nil, err
+	}
+
+	names := re.SubexpNames()
+	numFields := 0
+	for i := 1; i < len(names); i++ {
+		if names[i] != "" {
+			numFields++
+		}
+	}
+
+	plan, err := buildScanPlan(re, numFields)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Scanner{
+		schema:  schema,
+		fields:  plan,
+		scratch: make([][]byte, len(plan)),
+		opts:    Options{ZeroCopy: true},
+	}, nil
+}
+
+// NewExtractor is an alias for New for API compatibility.
+func NewExtractor(pattern string) (*Scanner, error) {
+	return New(pattern)
+}
+
+type Scanner struct {
+	schema  *arrow.Schema
+	fields  []fieldVM
+	scratch [][]byte
+	opts    Options
+}
+
+type Options struct {
+	ZeroCopy bool
+}
+
+// Scan writes captured fields into `out`. Returns true if at least one field was extracted.
+// The returned slices are valid only until the next Scan call when ZeroCopy=true.
+func (s *Scanner) Scan(line []byte, out [][]byte) bool {
+	if len(out) < len(s.fields) {
+		return false
+	}
+
+	pos := 0
+	n := len(line)
+
+	for i, f := range s.fields {
+		if f.isLast {
+			if pos < n {
+				out[i] = slice(line, pos, n, s.opts.ZeroCopy)
+			} else {
+				out[i] = nil
+			}
+			return true
+		}
+
+		idx := bytes.IndexByte(line[pos:], f.delim)
+		if idx < 0 {
+			out[i] = nil
+			pos = n
+		} else {
+			out[i] = slice(line, pos, pos+idx, s.opts.ZeroCopy)
+			pos += idx + 1
+		}
+	}
+	return true
+}
+
+func (s *Scanner) Schema() *arrow.Schema { return s.schema }
+
+// Scanner returns a new scanner with the given options (for chaining).
+func (s *Scanner) Scanner(opts Options) *Scanner {
+	s.opts = opts
+	return s
+}
+
+// WithOptions is an alias for Scanner.
+func (s *Scanner) WithOptions(opts Options) *Scanner {
+	return s.Scanner(opts)
+}
+
+// ============================================================
+// Writer (batch builder)
+// ============================================================
+
+type Writer struct {
+	schema   *arrow.Schema
+	mem      memory.Allocator
+	maxRows  int
+	builders []*array.BinaryBuilder
+	scratch  [][]byte
+	rows     int
+}
+
+func NewWriter(schema *arrow.Schema, mem memory.Allocator, maxRows int) *Writer {
+	if mem == nil {
+		mem = memory.DefaultAllocator
+	}
+	if maxRows <= 0 {
+		maxRows = 8192
+	}
+
+	numCols := len(schema.Fields())
+	builders := make([]*array.BinaryBuilder, numCols)
+	for i := range builders {
+		builders[i] = array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+	}
+
+	return &Writer{
+		schema:   schema,
+		mem:      mem,
+		maxRows:  maxRows,
+		builders: builders,
+		scratch:  make([][]byte, numCols),
+	}
+}
+
+// WriteLinesSIMD is the zero-allocation hot path.
+func (w *Writer) WriteLinesSIMD(lines [][]byte, s *Scanner) (arrow.Record, error) {
+	for _, line := range lines {
+		if !s.Scan(line, w.scratch) {
+			continue
+		}
+
+		for i, v := range w.scratch {
+			w.builders[i].Append(v)
+		}
+
+		w.rows++
+		if w.rows >= w.maxRows {
+			return w.Flush()
+		}
+	}
+	return nil, nil
+}
+
+// Flush returns the current batch and resets the writer.
+// The returned Record must be released by the caller.
+func (w *Writer) Flush() (arrow.Record, error) {
+	if w.rows == 0 {
+		return nil, nil
+	}
+
+	arrs := make([]arrow.Array, len(w.builders))
+	for i, b := range w.builders {
+		arrs[i] = b.NewArray()
+	}
+
+	rec := array.NewRecord(w.schema, arrs, int64(w.rows))
+
+	// Release arrays (Record holds references)
+	for _, a := range arrs {
+		a.Release()
+	}
+
+	// Reset builders for next batch
+	for _, b := range w.builders {
+		b.Release()
+	}
+	for i := range w.builders {
+		w.builders[i] = array.NewBinaryBuilder(w.mem, arrow.BinaryTypes.Binary)
+	}
+
+	w.rows = 0
+	return rec, nil
+}
+
+// ============================================================
+// ArrowWriter (legacy API for backward compatibility)
+// ============================================================
+
+type ArrowWriter struct {
+	schema      *arrow.Schema
+	builders    []*array.BinaryBuilder
+	mem         memory.Allocator
+	maxRows     int
+	rowsInBatch int
+}
+
+func NewArrowWriter(schema *arrow.Schema, mem memory.Allocator, maxRows int) *ArrowWriter {
+	if mem == nil {
+		mem = memory.DefaultAllocator
+	}
+	builders := make([]*array.BinaryBuilder, len(schema.Fields()))
+	for i := range builders {
+		builders[i] = array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+	}
+	return &ArrowWriter{schema: schema, builders: builders, mem: mem, maxRows: maxRows}
+}
+
+func (w *ArrowWriter) Append(values []string) {
+	for i, v := range values {
+		w.builders[i].Append([]byte(v))
+	}
+	w.rowsInBatch++
+}
+
+func (w *ArrowWriter) ShouldFlush() bool {
+	return w.maxRows > 0 && w.rowsInBatch >= w.maxRows
+}
+
+func (w *ArrowWriter) Rows() int {
+	return w.rowsInBatch
+}
+
+func (w *ArrowWriter) Flush() arrow.Record {
+	arrays := make([]arrow.Array, len(w.builders))
+	for i, b := range w.builders {
+		arrays[i] = b.NewArray()
+		b.Release()
+		w.builders[i] = array.NewBinaryBuilder(w.mem, arrow.BinaryTypes.Binary)
+	}
+	rec := array.NewRecord(w.schema, arrays, int64(w.rowsInBatch))
+	for _, arr := range arrays {
+		arr.Release()
+	}
+	w.rowsInBatch = 0
+	return rec
+}
+
+// ============================================================
+// Internal helpers
+// ============================================================
+
+type fieldVM struct {
+	delim  byte
+	isLast bool
+}
+
+func buildScanPlan(re *regexp.Regexp, numFields int) ([]fieldVM, error) {
+	ast, err := syntax.Parse(re.String(), syntax.Perl)
+	if err != nil {
+		return nil, err
+	}
+
+	fields := make([]fieldVM, 0, numFields)
+	var literals []byte
+
+	if ast.Op == syntax.OpConcat {
+		for _, n := range ast.Sub {
+			if n.Op == syntax.OpLiteral && len(n.Rune) > 0 {
+				literals = append(literals, byte(n.Rune[0]))
+			}
+		}
+	}
+
+	litIdx := 0
+	for i := 0; i < numFields; i++ {
+		vm := fieldVM{}
+		if litIdx < len(literals) {
+			vm.delim = literals[litIdx]
+			litIdx++
+		} else {
+			vm.isLast = true
+		}
+		fields = append(fields, vm)
+	}
+	return fields, nil
+}
+
+// ExtractSchema is kept for external use (uses Binary for raw captures).
 func ExtractSchema(re *regexp.Regexp) (*arrow.Schema, error) {
 	if re == nil {
 		return nil, errors.New("nil regexp")
 	}
-	var fields []arrow.Field
 	names := re.SubexpNames()
+	fields := make([]arrow.Field, 0, len(names))
 	for i := 1; i < len(names); i++ {
-		name := names[i]
-		if name == "" {
-			continue
+		if names[i] != "" {
+			fields = append(fields, arrow.Field{
+				Name: names[i],
+				Type: arrow.BinaryTypes.Binary,
+			})
 		}
-		fields = append(fields, arrow.Field{Name: name, Type: arrow.BinaryTypes.String})
 	}
 	if len(fields) == 0 {
 		return nil, errors.New("pattern must contain named capture groups")
@@ -29,15 +310,11 @@ func ExtractSchema(re *regexp.Regexp) (*arrow.Schema, error) {
 	return arrow.NewSchema(fields, nil), nil
 }
 
-// ParseLine returns regex capture groups for the line. Non-matching lines return nil.
+// Legacy helpers (kept for compatibility)
 func ParseLine(line string, re *regexp.Regexp) []string {
 	return ExtractValues[string](line, re)
 }
 
-// ExtractValues returns regex capture groups for the line as either strings or
-// byte slices depending on the type parameter. The slice capacity matches the
-// number of capture groups to minimize allocations. Non-matching lines return
-// nil.
 func ExtractValues[T ~string | ~[]byte](line T, re *regexp.Regexp) []T {
 	if re == nil {
 		return nil
@@ -69,57 +346,12 @@ func ExtractValues[T ~string | ~[]byte](line T, re *regexp.Regexp) []T {
 	}
 }
 
-// ArrowWriter writes record batches with flushing to limit memory usage.
-type ArrowWriter struct {
-	schema      *arrow.Schema
-	builders    []*array.StringBuilder
-	mem         memory.Allocator
-	maxRows     int
-	rowsInBatch int
-}
-
-// NewArrowWriter creates a writer that buffers rows up to maxRows per batch.
-func NewArrowWriter(schema *arrow.Schema, mem memory.Allocator, maxRows int) *ArrowWriter {
-	if mem == nil {
-		mem = memory.DefaultAllocator
+// slice helper
+func slice(b []byte, start, end int, zero bool) []byte {
+	if zero {
+		return b[start:end]
 	}
-	builders := make([]*array.StringBuilder, len(schema.Fields()))
-	for i := range builders {
-		builders[i] = array.NewStringBuilder(mem)
-	}
-	return &ArrowWriter{schema: schema, builders: builders, mem: mem, maxRows: maxRows}
-}
-
-// Append adds a row of string values to the current batch.
-func (w *ArrowWriter) Append(values []string) {
-	for i, v := range values {
-		w.builders[i].Append(v)
-	}
-	w.rowsInBatch++
-}
-
-// ShouldFlush returns true if the buffered rows exceed the flush interval.
-func (w *ArrowWriter) ShouldFlush() bool {
-	return w.maxRows > 0 && w.rowsInBatch >= w.maxRows
-}
-
-// Rows returns the number of rows currently buffered.
-func (w *ArrowWriter) Rows() int {
-	return w.rowsInBatch
-}
-
-// Flush returns a record batch containing buffered rows and resets builders.
-func (w *ArrowWriter) Flush() arrow.Record {
-	arrays := make([]arrow.Array, len(w.builders))
-	for i, b := range w.builders {
-		arrays[i] = b.NewArray()
-		b.Release()
-		w.builders[i] = array.NewStringBuilder(w.mem)
-	}
-	rec := array.NewRecord(w.schema, arrays, int64(w.rowsInBatch))
-	for _, arr := range arrays {
-		arr.Release()
-	}
-	w.rowsInBatch = 0
-	return rec
+	cp := make([]byte, end-start)
+	copy(cp, b[start:end])
+	return cp
 }
