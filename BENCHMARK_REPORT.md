@@ -14,37 +14,49 @@ Carve v0.4.0 introduces a new **high-performance Scanner API** that achieves **5
 
 - **Scanner API**: ~140M lines/second (7ns per line, **zero allocations**)
 - **Regex API**: ~2.5M lines/second (390ns per line, 4000 allocs)
-- **End-to-End Scanner**: ~21K lines/second with Arrow output (47KB/op, 122 allocs)
-- **End-to-End Regex**: ~2.3K lines/second with Arrow output (450KB/op, 4121 allocs)
-- **9x faster** end-to-end with Scanner API
-- **34x fewer allocations** with Scanner API
+- **End-to-End Scanner**: ~24K lines/second with Arrow output (145KB/op, 63 allocs)
+- **End-to-End Regex**: ~2.3K lines/second with Arrow output (450KB/op, 4103 allocs)
+- **10x faster** end-to-end with Scanner API
+- **65x fewer allocations** with Scanner API
+
+## Optimizations Applied (v0.4.1)
+
+### v0.4.2 - Bulk AppendValues Optimization (Latest)
+- **Bulk API**: Replaced per-row `Append()` calls with `AppendValues()` for batch inserts
+- **Pre-allocated temp buffers**: Added `tempColVals` and `tempValids` slices allocated once at Writer creation
+- **ReserveData**: Pre-reserve builder capacity before bulk append to minimize internal reallocations
+- **Result**: 13% faster throughput, 40% fewer allocations, 31% less memory
+
+### v0.4.1 - Builder Reuse
+- **Builder Reuse**: Builders are now reused across Flush() calls instead of being recreated
+- **Hot Loop Optimization**: WriteLinesSIMD caches local variables to reduce pointer chasing
 
 ## API Comparison: Regex vs Scanner
 
 ### 1. Parse Line Performance
 
 ```
-BenchmarkAPIComparison_ParseLine    396μs/op    238KB/op    4000 allocs/op
-BenchmarkAPIComparison_Scanner      7.2μs/op      0KB/op       0 allocs/op
+BenchmarkAPIComparison_ParseLine    411μs/op    238KB/op    4000 allocs/op
+BenchmarkAPIComparison_Scanner      7.1μs/op      0KB/op       0 allocs/op
 ```
 
 | Metric | Regex API | Scanner API | Improvement |
 |--------|-----------|-------------|-------------|
-| Time per line | 397μs | 7.2μs | **55x faster** |
+| Time per line | 411μs | 7.1μs | **58x faster** |
 | Memory per line | 238KB | 0KB | **zero allocation** |
 | Allocations per line | 4,000 | 0 | **100% reduction** |
 
 ### 2. End-to-End Performance
 
 ```
-BenchmarkAPIComparison_E2E_Regex     450KB/op    4121 allocs/op
-BenchmarkAPIComparison_E2E_Scanner    47KB/op     122 allocs/op
+BenchmarkAPIComparison_E2E_Regex     450KB/op    4103 allocs/op
+BenchmarkAPIComparison_E2E_Scanner   145KB/op      63 allocs/op
 ```
 
 | Metric | Regex API | Scanner API | Improvement |
 |--------|-----------|-------------|-------------|
-| Memory per line | 450KB | 47KB | **10x less** |
-| Allocations per line | 4,121 | 122 | **34x fewer** |
+| Memory per line | 450KB | 145KB | **3.1x less** |
+| Allocations per line | 4,103 | 63 | **65x fewer** |
 
 ### 3. Throughput Analysis
 
@@ -53,7 +65,7 @@ BenchmarkAPIComparison_E2E_Scanner    47KB/op     122 allocs/op
 | ParseLine (regex) | ~2,500,000 | ~250 MB/s |
 | Scanner (new) | ~140,000,000 | ~14,000 MB/s |
 | E2E Regex | ~2,300 | ~0.23 MB/s |
-| E2E Scanner | ~21,000 | ~2.1 MB/s |
+| E2E Scanner | ~24,400 | ~2.4 MB/s |
 
 > **Note**: ParseLine benchmarks measure pure parsing speed. End-to-end benchmarks include Arrow record creation and memory allocation.
 
@@ -91,15 +103,15 @@ BenchmarkScanner_LowMatchRate-10         77.7μs/op (13K lines)
 ### WriteLines Performance
 
 ```
-BenchmarkWriter_WriteLines               47.2μs/op    211KB/op    122 allocs/op
-BenchmarkWriter_WriteLines_MultipleBatches  68.9μs/op    273KB/op    800 allocs/op
+BenchmarkWriter_WriteLines               41.0μs/op    145KB/op     63 allocs/op
+BenchmarkWriter_WriteLines_MultipleBatches  47.2μs/op    103KB/op    360 allocs/op
 ```
 
 **Interpretation:**
-- **Single batch**: 21,200 lines/second with Arrow output
-- **Multiple batches**: 14,500 lines/second (includes batch overhead)
-- **Memory efficient**: ~211KB per batch
-- **Arrow integration**: 122 allocations per batch
+- **Single batch**: 24,400 lines/second with Arrow output (17% improvement)
+- **Multiple batches**: 21,200 lines/second (45% faster than before)
+- **Memory per batch**: ~145KB
+- **Arrow integration**: 63 allocations per batch (48% fewer than v0.4.0)
 
 ## File Size Performance
 
@@ -232,12 +244,13 @@ Line → Pre-compiled Scan Plan → IndexByte Scan → BinaryBuilder.Append → 
 
 ## Conclusion
 
-Carve v0.4.0 with the new Scanner API achieves **production-ready performance** for high-throughput log processing:
+Carve v0.4.x with the Scanner API and bulk append optimization achieves **production-ready performance** for high-throughput log processing:
 
 1. **55x faster parsing** with zero allocations
-2. **9x faster end-to-end** with Arrow output
-3. **34x fewer memory allocations**
+2. **10x faster end-to-end** with Arrow output
+3. **65x fewer memory allocations** (63 vs 4,103)
 4. **214x faster** on pathological input
+5. **13% faster** than previous version with bulk AppendValues
 
 The Scanner API is recommended for all high-throughput workloads, while the Regex API remains available for cases requiring complex pattern matching.
 
