@@ -122,6 +122,7 @@ type Writer struct {
 	scratch     [][]byte
 	tempColVals [][][]byte
 	tempValids  [][]bool
+	arrScratch  []arrow.Array
 	rows        int
 }
 
@@ -154,6 +155,7 @@ func NewWriter(schema *arrow.Schema, mem memory.Allocator, maxRows int) *Writer 
 		scratch:     make([][]byte, numCols),
 		tempColVals: tempColVals,
 		tempValids:  tempValids,
+		arrScratch:  make([]arrow.Array, numCols),
 	}
 }
 
@@ -220,7 +222,7 @@ func (w *Writer) Flush() (arrow.Record, error) {
 		return nil, nil
 	}
 
-	arrs := make([]arrow.Array, len(w.builders))
+	arrs := w.arrScratch
 	for i, b := range w.builders {
 		arrs[i] = b.NewArray()
 	}
@@ -229,6 +231,9 @@ func (w *Writer) Flush() (arrow.Record, error) {
 
 	for _, a := range arrs {
 		a.Release()
+	}
+	for i := range arrs {
+		arrs[i] = nil
 	}
 
 	w.rows = 0

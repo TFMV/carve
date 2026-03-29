@@ -10,6 +10,37 @@
 
 Carve v0.4.0 introduces a new **high-performance Scanner API** that achieves **55x faster parsing** and **zero allocations** compared to the regex-based approach. The benchmarks demonstrate that the new Scanner API is production-ready for high-throughput log processing workloads.
 
+## v0.4.3 Throughput Experiment Log (March 29, 2026)
+
+Reproducible command:
+
+```bash
+go test ./pkg/carve -run '^$' -bench '^(BenchmarkScannerScan|BenchmarkWriterWriteLinesSIMD|BenchmarkFlush|BenchmarkEndToEndPipeline)$' -benchmem -benchtime=3s -count=3
+```
+
+### Change 1 (REVERTED): manual delimiter scan in `Scanner.Scan`
+
+Hypothesis: replacing `bytes.IndexByte` with an inline delimiter loop removes subslice overhead and improves branch predictability.
+
+Result: rejected. `ScannerScan` regressed substantially (about 140ns/op ➜ 230ns/op in the short-run experiment), so `bytes.IndexByte` was restored.
+
+Conclusion: **REVERT**.
+
+### Change 2 (KEPT): reuse `[]arrow.Array` scratch in `Writer.Flush`
+
+Hypothesis: reusing the `arrs` slice in `Flush` removes one allocation per flush and reduces GC pressure in hot write/flush loops.
+
+| Change | ns/op | B/op | allocs/op | throughput |
+| ------ | ----- | ---- | --------- | ---------- |
+| Baseline `BenchmarkWriterWriteLinesSIMD` | 1,675,974 | 1,271,850 | 63 | 254.54 MB/s |
+| Reuse `arrs` slice (`BenchmarkWriterWriteLinesSIMD`) | 1,614,901 | 1,271,866 | 63 | 261.31 MB/s |
+| Baseline `BenchmarkFlush` | 1,962,545 | 1,520,620 | 109 | n/a |
+| Reuse `arrs` slice (`BenchmarkFlush`) | 1,835,401 | 1,520,569 | 108 | n/a |
+| Baseline `BenchmarkEndToEndPipeline` | 1,931,032 | 1,271,857 | 63 | 218.38 MB/s |
+| Reuse `arrs` slice (`BenchmarkEndToEndPipeline`) | 1,848,092 | 1,271,872 | 63 | 228.29 MB/s |
+
+Conclusion: **KEEP**.
+
 ### Key Performance Highlights
 
 - **Scanner API**: ~140M lines/second (7ns per line, **zero allocations**)
